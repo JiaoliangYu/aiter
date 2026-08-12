@@ -22,6 +22,7 @@ import flydsl.expr as fx
 import mori.shmem as ms
 import torch
 from mori.shmem import mori_shmem_create_tensor, mori_shmem_free_tensor
+from mori.shmem.tensor_utils import symm_mori_shmem_tensor
 
 from aiter.ops.flydsl.kernels.moonep_weight_prefetch_fast import (
     make_moonep_weight_prefetch_fast_jit,
@@ -96,6 +97,34 @@ class MoonEPWeightPool:
             block_threads=block_threads,
         )
         self._compiled = None
+
+    def peer_home_view(self, peer: int) -> torch.Tensor:
+        """This pool's home segment as it lives on ``peer``.
+
+        MoonEP's contract lets a destination execute a remote expert it holds
+        no prefetch slot for, by addressing the owner's weights directly --
+        "the group GEMM reads the overflow weights straight from the home rank
+        through the symmetric mapping".  Upstream gets one contiguous ``[E+B]``
+        VMM range covering every rank, so a single tensor suffices; mori hands
+        out a separate base address per peer (``peerPtrs[pe] + offset``), so
+        the equivalent here is one view per owner rank.
+
+        Only the home segment is exposed: a peer's prefetch slots hold whatever
+        *it* borrowed, which says nothing about the expert we are after.
+        """
+        if self._closed:
+            raise RuntimeError("weight pool is closed")
+        if not self._staged:
+            raise RuntimeError(
+                "stage_home() must run on every rank before a peer's weights "
+                "can be read"
+            )
+        if peer == self.rank:
+            return self.home
+        slots = self.experts_per_rank + self.prefetch_slots
+        peer_raw = symm_mori_shmem_tensor(self._raw, peer)
+        peer_pool = peer_raw.view(self.dtype).reshape(slots, *self.weight_shape)
+        return peer_pool[: self.experts_per_rank]
 
     def stage_home(self, weights: torch.Tensor) -> None:
         """Copy this rank's expert weights into the symmetric home segment."""

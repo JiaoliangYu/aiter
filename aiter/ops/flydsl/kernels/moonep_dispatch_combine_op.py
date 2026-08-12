@@ -270,10 +270,19 @@ class MoonEPDispatchCombineIntraNodeOp:
         non-empty and dropping them loses real tokens.  The returned vector is
         therefore ``E/R + B`` long, home groups first.
 
-        Any *other* non-empty group means the planner assigned this rank work
-        for a remote expert it has no prefetch slot for; that is a shortage of
-        ``prefetch_slots``, and the experts step would fail on it further
-        downstream with no hint of the cause, so it is caught here.
+        A *third* kind of group can be non-empty: a remote expert the planner
+        allocated rows for without giving this rank a prefetch slot.  That is
+        not an error.  MoonEP's contract makes ``B`` a performance knob, not a
+        correctness floor -- upstream's README says of ``B < E/R``: "If a rank
+        ever needs more distinct remote experts than B, the group GEMM reads
+        the overflow weights straight from the home rank through the symmetric
+        mapping -- slightly slower, with no impact on correctness."  The
+        balancer is free to ignore ``B`` precisely because of this fallback.
+        ``overflow_groups()`` enumerates them and ``run_experts`` gives each
+        its own call against the owner's pool.
+
+        The returned vector therefore covers home groups, migration slots and
+        overflow groups -- every row this rank executes.
         """
 
         sizes = cu_seqlens - torch.cat(
@@ -283,15 +292,51 @@ class MoonEPDispatchCombineIntraNodeOp:
         lo = self.cfg.rank * self.cfg.num_experts_per_rank
         hi = lo + self.cfg.num_experts_per_rank
         mine = torch.cat([sizes[lo:hi], sizes[e:]])
-        stray = int(sizes.sum().item()) - int(mine.sum().item())
-        if stray:
-            raise RuntimeError(
-                f"rank {self.cfg.rank}: {stray} dispatched rows belong to "
-                f"remote experts with no prefetch slot (prefetch_slots="
-                f"{self._act_cfg.prefetch_slots}, experts_per_rank="
-                f"{self.cfg.num_experts_per_rank}). Raise prefetch_slots."
+        overflow = torch.cat([sizes[:lo], sizes[hi:e]])
+        return torch.cat([mine, overflow]).to(torch.int32)
+
+    def overflow_groups(self) -> list[tuple[int, int, int]]:
+        """``(expert_id, row_lo, row_hi)`` per remote group with no slot.
+
+        Rows are laid out in group order, so each group is one contiguous
+        slice -- no gather is needed, just one experts call per group against
+        the owner rank's home segment.  Empty for the decode plan, which
+        migrates nothing.
+
+        This costs one device-to-host copy of ``cu_seqlens`` per layer.  It is
+        folded into the same sync ``expert_call_split`` already performs.
+        """
+
+        if not self.needs_split():
+            return []
+        plan = self.live_plan()
+        cu = plan.cu_seqlens.to("cpu", non_blocking=False).tolist()
+        gei = plan.group_expert_ids.to("cpu", non_blocking=False).tolist()
+        e = self.cfg.num_experts
+        epn = self.cfg.num_experts_per_rank
+        lo_e = self.cfg.rank * epn
+        hi_e = lo_e + epn
+        out: list[tuple[int, int, int]] = []
+        for g in range(e):
+            if lo_e <= g < hi_e:
+                continue
+            start = 0 if g == 0 else cu[g - 1]
+            if cu[g] > start and gei[g] >= 0:
+                out.append((gei[g], start, cu[g]))
+        # How much of the step actually takes the slower remote-weight path.
+        # Logged once per process: enough to size the effect, not enough to
+        # flood a 61-layer model.
+        if out and not getattr(self, "_overflow_logged", False):
+            self._overflow_logged = True
+            rows = sum(hi - lo for _, lo, hi in out)
+            print(
+                f"[MoonEP] rank {self.cfg.rank}: {len(out)} overflow groups, "
+                f"{rows} rows of {cu[-1]} ({100.0 * rows / max(cu[-1], 1):.2f}%) "
+                f"read weights from the owner (prefetch_slots="
+                f"{self._act_cfg.prefetch_slots})",
+                flush=True,
             )
-        return mine.to(torch.int32)
+        return out
 
     def decode_plan_available(self) -> bool:
         return self._decode_op is not None
@@ -307,8 +352,8 @@ class MoonEPDispatchCombineIntraNodeOp:
 
         return not self._act_cfg.no_migration
 
-    def expert_call_split(self) -> tuple[int, int, int]:
-        """``(home_end, total_rows, num_borrowed)`` for the two experts calls.
+    def expert_call_split(self) -> tuple[int, int, int, int, int]:
+        """``(home_lo, home_hi, mig_lo, mig_hi, num_borrowed)``.
 
         aiter's quantised MoE gives a **zero** result when the weight tensor
         declares experts that no row routes to -- measured: any spare slot
@@ -329,17 +374,38 @@ class MoonEPDispatchCombineIntraNodeOp:
         ``fused_moe`` already takes ``num_local_tokens`` as a device tensor, so
         the home call is free; the migration call would need its rows copied
         into their own buffer.
+
+        The home call can no longer start at row 0: an overflow group for a
+        lower-numbered expert sits in front of it in group order.  So the home
+        segment is bounded on both sides -- ``cu[rank*epn - 1]`` to
+        ``cu[(rank+1)*epn - 1]`` -- and whatever lies outside it below ``E``
+        belongs to ``overflow_groups()``.
         """
 
         plan = self.live_plan()
         cu = plan.cu_seqlens
         e = self.cfg.num_experts
+        epn = self.cfg.num_experts_per_rank
+        lo_e = self.cfg.rank * epn
         sel = plan.experts_to_copy[self.cfg.rank]
-        packed = torch.stack(
-            [cu[e - 1], cu[-1], (sel >= 0).sum().to(cu.dtype)]
+        first = cu.new_zeros(1) if lo_e == 0 else cu[lo_e - 1 : lo_e]
+        packed = torch.cat(
+            [
+                first,
+                cu[lo_e + epn - 1 : lo_e + epn],
+                cu[e - 1 : e],
+                cu[-1:],
+                (sel >= 0).sum().to(cu.dtype).reshape(1),
+            ]
         )
-        home_end, total, nb = packed.tolist()
-        return int(home_end), int(total), int(nb)
+        home_lo, home_hi, mig_lo, mig_hi, nb = packed.tolist()
+        return (
+            int(home_lo),
+            int(home_hi),
+            int(mig_lo),
+            int(mig_hi),
+            int(nb),
+        )
 
     def row_slot_ids(self) -> torch.Tensor:
         """Per-row local weight-pool slot, shaped ``[NvS, 1]`` for a topk-1 MoE.
@@ -392,6 +458,30 @@ class MoonEPDispatchCombineIntraNodeOp:
         """
 
         return self._act_op.expert_output
+
+    def dispatched_weights(self) -> torch.Tensor:
+        """The route weight of every dispatched row, in dispatch-row order.
+
+        One scalar per ``(token, expert)`` route, written by the dispatch
+        kernel into the destination's symmetric buffer.  The combine kernel is
+        built with ``apply_route_weights=False``, so it sums the top-k
+        contributions unweighted and the caller owes the weighting -- see
+        ``moonep_ep.py``, which multiplies ``expert_output`` by this vector
+        before calling combine.
+        """
+
+        return self._act_op.recv_route_weights
+
+    def gathered_weights(self) -> torch.Tensor:
+        """Per ``(token, k)`` route weight, as combine read it back.
+
+        Combine gathers each route's scalar from the rank that ran the expert,
+        so this is ``dispatched_weights`` mapped back to the source token's
+        layout -- the same shape as the caller's ``topk_weights``, and equal to
+        it if the whole weight path is sound.  Valid only after a combine.
+        """
+
+        return self._act_op.gathered_route_weights
 
     def combine_grouped(self, fused_expert_output: torch.Tensor) -> torch.Tensor:
         """Reduce the grouped expert outputs back to per-token rows."""

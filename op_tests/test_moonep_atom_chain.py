@@ -49,11 +49,26 @@ N = int(os.environ.get("T_N", str(S)))
 QUANT = os.environ.get("T_QUANT", "none")
 # Exercise the decode plan: no balancing, no migration, token_padding=1.
 DECODE = os.environ.get("T_DECODE", "0") == "1"
+# Overflow path knobs. B below the number of distinct remote experts a
+# destination needs is legal per MoonEP's contract -- the group GEMM then reads
+# those weights from the owner instead of a local slot. 0 keeps the config
+# default; T_SKEW concentrates routing so migration actually happens.
+T_B = int(os.environ.get("T_B", "0"))
+SKEW = float(os.environ.get("T_SKEW", "0"))
 
 
-def torch_reference(x, topk_ids, gate_all, up_all, down_all):
+def torch_reference(x, topk_ids, topk_w, gate_all, up_all, down_all):
+    """Weighted top-k MoE, the router's weighting included.
+
+    The weighting is not decoration: the chain applies it between the experts
+    and combine, and an earlier version of this reference dropped it exactly
+    as the chain did.  Both sides were then wrong in the same way, so the test
+    stayed green while serving lost ~10 points of gsm8k.  A reference that
+    shares a step with the code under test cannot falsify that step.
+    """
     out = torch.zeros_like(x, dtype=torch.float32)
     xf = x.float()
+    wf = topk_w.float()
     for k in range(topk_ids.shape[1]):
         for e in torch.unique(topk_ids[:, k]):
             e = int(e.item())
@@ -63,7 +78,7 @@ def torch_reference(x, topk_ids, gate_all, up_all, down_all):
             xs = xf[m]
             g = xs @ gate_all[e].float()
             u = xs @ up_all[e].float()
-            out[m] += (F.silu(g) * u) @ down_all[e].float()
+            out[m] += ((F.silu(g) * u) @ down_all[e].float()) * wf[m, k, None]
     return out
 
 
@@ -82,7 +97,19 @@ def main() -> int:
 
     g = torch.Generator(device="cpu").manual_seed(7)
     x = (torch.randn(N, H, generator=g) * 0.3).to(torch.bfloat16).to(dev)
-    topk = torch.rand(N, E, generator=g).topk(K, dim=1).indices.to(torch.int32).to(dev)
+    if SKEW > 0:
+        # Uniform routing barely migrates anything, so a destination never
+        # needs more distinct remote experts than B and the overflow path is
+        # unreachable.  A zipf prior over experts makes some home groups
+        # overloaded, which is what forces migration in the first place.
+        # Gumbel top-k: same distribution over k-subsets, one vectorised call.
+        log_w = -SKEW * torch.log(torch.arange(1, E + 1, dtype=torch.float64))
+        log_w = log_w[torch.randperm(E, generator=g)]
+        u = torch.rand(N, E, generator=g, dtype=torch.float64).clamp_min(1e-300)
+        scores = log_w[None, :] - torch.log(-torch.log(u))
+    else:
+        scores = torch.rand(N, E, generator=g)
+    topk = scores.topk(K, dim=1).indices.to(torch.int32).to(dev)
     w = torch.rand(N, K, generator=g).float().to(dev)
 
     # Every rank needs all experts' weights to build the ground truth, so
@@ -100,6 +127,7 @@ def main() -> int:
         num_experts_per_rank=epn,
         num_experts_per_token=K,
         max_decode_token_per_rank=S if DECODE else 0,
+        **({"prefetch_slots": T_B} if T_B > 0 else {}),
     )
     op = MoonEPDispatchCombineIntraNodeOp(cfg)
     rows, row_w, cu = op.dispatch_grouped(x, w, topk, decode=DECODE)
@@ -188,6 +216,31 @@ def main() -> int:
         if p is not None:
             p.prefetch(sel)
 
+    # peer_home_view is what the overflow path reads when a remote expert has
+    # no prefetch slot, and it is the one piece the B<=4 configs never got to
+    # exercise.  It has a ground truth right here: peer p's home segment must
+    # be exactly the global tensor's rows [p*epn, (p+1)*epn).  Byte-exact, not
+    # approximate -- it is the same memory, reached over P2P.
+    for name, p, src_full in (("w13", pw1, w13), ("w2", pw2, w2t)):
+        if p is None:
+            continue
+        for peer in range(world):
+            got = p.peer_home_view(peer)
+            want = src_full[peer * epn : (peer + 1) * epn]
+            if got.shape != want.shape:
+                raise AssertionError(
+                    f"rank{rank}: peer_home_view({peer}) {name} shape "
+                    f"{tuple(got.shape)} != {tuple(want.shape)}"
+                )
+            bad = int((got != want).sum().item())
+            if bad:
+                raise AssertionError(
+                    f"rank{rank}: peer_home_view({peer}) {name} differs in "
+                    f"{bad}/{want.numel()} elements"
+                )
+    if rank == 0:
+        print("[peer] peer_home_view matches the owner's rows", flush=True)
+
     # The pool must be a byte-exact copy of what ATOM would have handed the
     # kernel; if it is not, nothing downstream can be trusted.
     for name, p, src in (
@@ -214,11 +267,16 @@ def main() -> int:
     # to, so home and borrowed experts cannot share one tensor.
     slot_ids = op.row_slot_ids()
     out = op.get_expert_output_buffer()
-    home_end, total, nb = (
-        op.expert_call_split() if op.needs_split() else (0, 0, 0)
+    home_lo, home_end, mig_lo, total, nb = (
+        op.expert_call_split() if op.needs_split() else (0, 0, 0, 0, 0)
     )
+    overflow = op.overflow_groups()
     if rank == 0:
-        print(f"[split] home_end={home_end} total={total} borrowed={nb}", flush=True)
+        print(
+            f"[split] home=[{home_lo},{home_end}) mig=[{mig_lo},{total}) "
+            f"borrowed={nb} overflow={len(overflow)}",
+            flush=True,
+        )
 
     def seg(p, s0, s1):
         if p is None:
@@ -239,7 +297,9 @@ def main() -> int:
             rows[a:b],
             wseg(pw1, s0, s1),
             wseg(pw2, s0, s1),
-            torch.ones((b - a, 1), dtype=torch.float32, device=dev),
+            # Real route weights, as the adapter passes them: combine is a
+            # plain K-sum, so the weighting has to enter here.
+            row_w[a:b].unsqueeze(1),
             slot_ids[a:b],
             None,
             ActivationType.Silu,
@@ -288,8 +348,11 @@ def main() -> int:
     # E-expert tensor with global ids. The borrowed experts' weights exist
     # locally in this test, so this isolates the prefetched slabs.
     if total > home_end:
+        # Weighted the same way `experts` now weights, so this stays a test of
+        # where the *weights of the expert* came from (prefetched slab vs the
+        # full tensor) and not of the route weighting.
         ra = fused_moe(rows[home_end:total], w13, w2t,
-                       torch.ones((total - home_end, 1), dtype=torch.float32, device=dev),
+                       row_w[home_end:total].unsqueeze(1),
                        gids[home_end:total], None, ActivationType.Silu,
                        quant_type=qt, w1_scale=sc1, w2_scale=sc2, dtype=rows.dtype).float()
         rb = out[home_end:total].float()
@@ -311,14 +374,14 @@ def main() -> int:
     # max|.| for random weights. Loose, but it is an honest bound, and the
     # failures worth catching here (is_shuffled dropped, wrong expert, dead
     # migration group) all land far above it.
-    exp = torch_reference(x, topk, gate_all, up_all, down_all)
+    exp = torch_reference(x, topk, w, gate_all, up_all, down_all)
     if QUANT == "mxfp4":
         tol = 5.0e-1
     # Triangulation: which of got / exp is the odd one out? torch bf16 is a
     # third, independent opinion. mxfp4 is coarse (~30% on max|.|), so this
     # cannot be a tight bound -- it only has to separate "close" from "wrong".
     if QUANT == "mxfp4" and rank == 0:
-        ref_t = torch_reference(x, topk, gate_all, up_all, down_all)
+        ref_t = torch_reference(x, topk, w, gate_all, up_all, down_all)
         st = ref_t.abs().max().item()
         print(
             f"[tri] vs torch-bf16: got rel={(ref_t-got).abs().max().item()/max(st,1e-9):.3e} "
