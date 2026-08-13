@@ -46,12 +46,14 @@ crossover, not a model.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import mori.shmem as ms
 import torch
-import torch.distributed as dist
+from mori.shmem import mori_shmem_create_tensor, mori_shmem_free_tensor
+from mori.shmem.tensor_utils import symm_mori_shmem_tensor
 
 from aiter.ops.flydsl.moonep import (
     MoonEPGpuPlanner,
@@ -157,6 +159,25 @@ class MoonEPDispatchCombineIntraNodeOp:
                 cfg.hidden_dim,
                 block_num=cfg.dispatch_block_num,
             )
+        # Global expert histogram, exchanged over the symmetric heap rather
+        # than with a collective.  Upstream does this inside the planning
+        # kernel (planning.py Phase A: copy_v4_remote of the local [E] into
+        # meta_buf at rank*E, then a self-resetting cross-rank barrier), which
+        # is why its `tokens_per_expert` argument is documented as *local*.
+        # Building the [R, E] matrix with dist.all_gather instead cost a full
+        # NCCL collective per MoE layer -- 1760 ms, 25% of prefill GPU time,
+        # almost all of it waiting, for 12 KB of payload.  Allocated here so
+        # the collective allocation order matches on every PE.
+        self._tpe_symm = mori_shmem_create_tensor(
+            (cfg.world_size, cfg.num_experts), torch.int32
+        )
+        # symm_mori_shmem_tensor returns the local tensor for our own rank and
+        # preserves dtype and shape for the rest, so the list is uniform.
+        self._tpe_peer = [
+            symm_mori_shmem_tensor(self._tpe_symm, p)
+            for p in range(cfg.world_size)
+        ]
+        self._check_tpe = os.environ.get("MOONEP_CHECK_TPE", "0") == "1"
         # Whichever instance the live plan belongs to.
         self._act_op = self._op
         self._act_planner = self._planner
@@ -203,11 +224,63 @@ class MoonEPDispatchCombineIntraNodeOp:
         base = torch.arange(rows * k, device=self.device, dtype=torch.int32)
         return (base % self.cfg.num_experts).reshape(rows, k)
 
-    def _build_plan(self, indices: torch.Tensor) -> MoonEPReferencePlan:
-        """Local histogram -> all-gather -> GPU plan.
+    def _publish_tpe(self, tpe: torch.Tensor) -> torch.Tensor:
+        """Put this rank's ``[E]`` histogram in every rank's ``[R, E]`` view.
 
-        The all-gather is a cost the mori and FlyDSL backends do not pay; it is
-        intrinsic to MoonEP, which balances against the *global* expert load.
+        Push rather than pull: each rank writes its own row into all peers,
+        then one device barrier makes the whole matrix readable everywhere.
+        Remote writes run at 448 GB/s against 235 GB/s for remote reads on this
+        link, and a write needs no return trip.
+
+        Ordering across layers is already covered: the next layer cannot start
+        writing until every rank has passed the barrier that ``dispatch``
+        enqueues after its kernel, which is downstream of this layer's reads.
+
+        One small copy per peer is R launches per layer, a few us each, plus
+        one barrier at ~250 us measured. Against the ~92 ms per prefill step
+        the collective was costing (1783 ms over 1178 calls, 61 layers) that
+        is worth measuring before folding the writes into the meta kernel the
+        way upstream does.
+        """
+
+        rank = self.cfg.rank
+        for view in self._tpe_peer:
+            view[rank].copy_(tpe)
+        ms.shmem_barrier_on_stream(torch.cuda.current_stream(self.device))
+        if self._check_tpe:
+            self._assert_matches_all_gather(tpe)
+        return self._tpe_symm
+
+    def _assert_matches_all_gather(self, tpe: torch.Tensor) -> None:
+        """Compare the exchanged matrix against the collective it replaced.
+
+        The chain test cannot catch a bad exchange on its own: the histogram
+        only feeds the planner's balancing decision, so a matrix that is wrong
+        but *identically* wrong on every rank still produces correct numbers.
+        Only a direct comparison rules that out. Gated because it costs the
+        collective plus a device sync per layer.
+        """
+
+        import torch.distributed as dist
+
+        want = [torch.empty_like(tpe) for _ in range(self.cfg.world_size)]
+        dist.all_gather(want, tpe)
+        want = torch.stack(want)
+        if not torch.equal(self._tpe_symm, want):
+            bad = (self._tpe_symm != want).any(dim=1).nonzero().flatten()
+            raise AssertionError(
+                f"rank {self.cfg.rank}: symmetric-heap histogram disagrees "
+                f"with all_gather on rows {bad.tolist()}"
+            )
+
+    def _build_plan(self, indices: torch.Tensor) -> MoonEPReferencePlan:
+        """Local histogram -> symmetric-heap exchange -> GPU plan.
+
+        The global histogram is genuinely needed per layer -- MoonEP balances
+        against the whole group's expert load and the routing differs layer to
+        layer -- so this is not something to do less often. Upstream does it
+        every layer too; it just does it inside the planning kernel over the
+        NVLink meta buffer instead of with a collective.
         """
         e = self.cfg.num_experts
         # Negative ids are the planner's idle mark -- padding rows here, and
@@ -219,9 +292,7 @@ class MoonEPDispatchCombineIntraNodeOp:
         tpe.scatter_add_(
             0, flat.clamp_min(0), (flat >= 0).to(torch.int32)
         )
-        gathered = [torch.empty_like(tpe) for _ in range(self.cfg.world_size)]
-        dist.all_gather(gathered, tpe)
-        tpe_all = torch.stack(gathered)
+        tpe_all = self._publish_tpe(tpe)
         # Kept for the maxvio property; computing it here would cost a device
         # sync on every MoE layer for a number the serving path never reads.
         self._tpe_all = tpe_all
@@ -534,6 +605,8 @@ class MoonEPDispatchCombineIntraNodeOp:
             return
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
+        self._tpe_peer = []
+        mori_shmem_free_tensor(self._tpe_symm)
         self._op.close()
         if self._decode_op is not None:
             self._decode_op.close()
