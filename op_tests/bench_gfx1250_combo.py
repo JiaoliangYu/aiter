@@ -1634,7 +1634,12 @@ DSV4_OPS = [
     # 1/32/96/112/128/512 pass, 2/4/8/16/64 fail, 4/4 reproducible either way.
     # Pinning -m past those M would make it runnable here, but the reported
     # kernel would no longer be the tuned one. Fix #4773's rows instead.
-    # "a8w8_blockscale",
+    #
+    # In the sweep on purpose, so the failure is in front of whoever runs it
+    # rather than in a comment. --dsv4 therefore exits 1 until the gluon rows
+    # are fixed; every other op still reports, and the tail lists this one as
+    # the failure. Comment it out again to get a green run.
+    "a8w8_blockscale",
     "a16w16",
     "mla_v4_decode",
     "inverse_rope",
