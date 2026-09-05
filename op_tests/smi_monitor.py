@@ -3,9 +3,9 @@
 # ruff: noqa: BLE001, PYI034, S110, UP035, UP037
 """AMD GPU metrics monitor using amdsmi.
 
-ROCm ships the binding without a setup.py. Make it importable with::
-
-    export PYTHONPATH=/opt/rocm/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}
+ROCm ships the binding without a setup.py. This module adds its standard path,
+``/opt/rocm/share/amd_smi``, to both ``PYTHONPATH`` and the current process's
+``sys.path`` before importing it.
 
 Usage (context manager):
     with GpuMonitor(device_index=0, interval_s=0.05) as mon:
@@ -25,12 +25,27 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from typing import Generator
 
 SMI_RESULT_PREFIX = "AITER_SMI_RESULT "
+_ROCM_AMDSMI_PATH = "/opt/rocm/share/amd_smi"
+
+# PYTHONPATH is inherited by child UTs, while sys.path is what makes the binding
+# visible to this already-running interpreter. Preserve any caller-provided
+# entries and only add ROCm's unpackaged binding when it is present.
+if os.path.isdir(_ROCM_AMDSMI_PATH):
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath_entries = pythonpath.split(os.pathsep) if pythonpath else []
+    if _ROCM_AMDSMI_PATH not in pythonpath_entries:
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            [_ROCM_AMDSMI_PATH, *pythonpath_entries]
+        )
+    if _ROCM_AMDSMI_PATH not in sys.path:
+        sys.path.insert(0, _ROCM_AMDSMI_PATH)
 
 try:
     import amdsmi
